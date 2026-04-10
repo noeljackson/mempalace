@@ -35,15 +35,41 @@ def _normalize_include(include: Optional[Sequence[str]]) -> List[str]:
     return list(include or [])
 
 
-def _normalize_where(where: Optional[Dict[str, Any]]) -> List[tuple[str, Any]]:
+def _normalize_where(where: Optional[Dict[str, Any]]) -> List[tuple[str, str, Any]]:
+    """Return (key, operator, value) triples from a Chroma-style where dict.
+
+    Supported forms:
+        {"key": "val"}                      → ("key", "=", "val")
+        {"key": {"$ne": "val"}}             → ("key", "!=", "val")
+        {"key": {"$gt": 5}}                 → ("key", ">", 5)
+        {"$and": [{...}, {...}]}            → flattened triples
+    """
+    _OPERATORS: Dict[str, str] = {
+        "$eq": "=",
+        "$ne": "!=",
+        "$gt": ">",
+        "$gte": ">=",
+        "$lt": "<",
+        "$lte": "<=",
+    }
     if not where:
         return []
     if "$and" in where:
-        pairs: List[tuple[str, Any]] = []
+        triples: List[tuple[str, str, Any]] = []
         for clause in where["$and"]:
-            pairs.extend(_normalize_where(clause))
-        return pairs
-    return list(where.items())
+            triples.extend(_normalize_where(clause))
+        return triples
+    result: List[tuple[str, str, Any]] = []
+    for key, value in where.items():
+        if isinstance(value, dict):
+            for op_key, op_val in value.items():
+                sql_op = _OPERATORS.get(op_key)
+                if sql_op is None:
+                    raise StorageError(f"Unsupported where operator: {op_key}")
+                result.append((key, sql_op, op_val))
+        else:
+            result.append((key, "=", value))
+    return result
 
 
 def _validate_metadata_key(key: str) -> str:
@@ -244,9 +270,7 @@ class ChromaBackend:
         try:
             import chromadb
         except Exception as exc:
-            raise StorageError(
-                "Chroma backend requested but chromadb is not installed."
-            ) from exc
+            raise StorageError("Chroma backend requested but chromadb is not installed.") from exc
 
         client = chromadb.PersistentClient(path=self.palace_path)
         try:
@@ -259,87 +283,68 @@ class ChromaBackend:
         return ChromaCollectionAdapter(collection)
 
 
+_VALID_WHERE_OPS = frozenset({"=", "!=", ">", ">=", "<", "<="})
+
+
 class PostgresCollectionAdapter:
     """Postgres + pgvector implementation of the collection interface."""
 
     def __init__(
         self,
-        dsn: str,
         collection_name: str,
+        pool,
+        sql_module,
         embedding_dimension: int = 384,
         embedding_model: Optional[str] = None,
+        dsn: Optional[str] = None,
     ):
-        self.dsn = dsn
         self.collection_name = collection_name
         self.embedding_dimension = embedding_dimension
         self.embedder = EmbeddingProvider(model_name=embedding_model)
-
-        try:
-            import psycopg
-        except Exception as exc:
-            raise StorageError(
-                "Postgres backend requested but psycopg is not installed."
-            ) from exc
-
-        self._psycopg = psycopg
-        self._ensure_schema()
+        self._pool = pool
+        self._sql = sql_module
+        # Fallback for standalone usage without a pool
+        self._dsn = dsn
+        self._psycopg: Any = None
 
     def _connect(self):
-        return self._psycopg.connect(self.dsn)
+        if self._pool is not None:
+            return self._pool.connection()
+        if self._psycopg is None:
+            import psycopg
 
-    def _ensure_schema(self) -> None:
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-                cur.execute(
-                    f"""
-                    CREATE TABLE IF NOT EXISTS mempalace_documents (
-                        collection_name TEXT NOT NULL,
-                        id TEXT NOT NULL,
-                        document TEXT NOT NULL,
-                        metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
-                        embedding vector({self.embedding_dimension}) NOT NULL,
-                        PRIMARY KEY (collection_name, id)
-                    )
-                    """
-                )
-                cur.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_mempalace_documents_collection
-                    ON mempalace_documents (collection_name)
-                    """
-                )
-                cur.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_mempalace_documents_metadata
-                    ON mempalace_documents USING GIN (metadata)
-                    """
-                )
-                cur.execute(
-                    """
-                    CREATE INDEX IF NOT EXISTS idx_mempalace_documents_embedding
-                    ON mempalace_documents USING hnsw (embedding vector_cosine_ops)
-                    """
-                )
-            conn.commit()
+            self._psycopg = psycopg
+        return self._psycopg.connect(self._dsn)
 
-    def _build_where_sql(self, where: Optional[Dict[str, Any]], params: List[Any]) -> str:
-        clauses = ["collection_name = %s"]
+    def _build_where_sql(self, where: Optional[Dict[str, Any]], params: List[Any]):
+        """Build a WHERE clause using psycopg.sql to prevent SQL injection."""
+        S = self._sql
+        clauses = [S.SQL("collection_name = %s")]
         params.append(self.collection_name)
 
-        for key, value in _normalize_where(where):
-            safe_key = _validate_metadata_key(key)
-            clauses.append(f"metadata ->> '{safe_key}' = %s")
+        for key, op, value in _normalize_where(where):
+            _validate_metadata_key(key)
+            if op not in _VALID_WHERE_OPS:
+                raise StorageError(f"Unsupported SQL operator: {op}")
+            clauses.append(
+                S.SQL("metadata ->> {key} {op} %s").format(
+                    key=S.Literal(key),
+                    op=S.SQL(op),
+                )
+            )
             params.append(_metadata_value(value))
 
-        return " WHERE " + " AND ".join(clauses)
+        return S.SQL(" WHERE ") + S.SQL(" AND ").join(clauses)
 
     def count(self) -> int:
+        S = self._sql
         params: List[Any] = []
-        sql = "SELECT COUNT(*) FROM mempalace_documents" + self._build_where_sql(None, params)
+        query = S.SQL("SELECT COUNT(*) FROM mempalace_documents") + self._build_where_sql(
+            None, params
+        )
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, params)
+                cur.execute(query, params)
                 row = cur.fetchone()
                 return int(row[0] if row else 0)
 
@@ -351,36 +356,40 @@ class PostgresCollectionAdapter:
         offset: Optional[int] = None,
         include: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
+        S = self._sql
         include = _normalize_include(include)
         want_docs = "documents" in include
         want_meta = "metadatas" in include
 
         params: List[Any] = []
-        sql = "SELECT id, document, metadata FROM mempalace_documents"
-        sql += self._build_where_sql(where, params)
+        parts = [S.SQL("SELECT id, document, metadata FROM mempalace_documents")]
+        parts.append(self._build_where_sql(where, params))
 
         if ids is not None:
-            sql += " AND id = ANY(%s)"
+            parts.append(S.SQL(" AND id = ANY(%s)"))
             params.append(list(ids))
 
-        sql += " ORDER BY id"
+        parts.append(S.SQL(" ORDER BY id"))
         if limit is not None:
-            sql += " LIMIT %s"
+            parts.append(S.SQL(" LIMIT %s"))
             params.append(limit)
         if offset is not None:
-            sql += " OFFSET %s"
+            parts.append(S.SQL(" OFFSET %s"))
             params.append(offset)
 
+        query = S.SQL("").join(parts)
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, params)
+                cur.execute(query, params)
                 rows = cur.fetchall()
 
         result: Dict[str, Any] = {"ids": [row[0] for row in rows]}
         if want_docs:
             result["documents"] = [row[1] for row in rows]
         if want_meta:
-            result["metadatas"] = [row[2] if isinstance(row[2], dict) else json.loads(row[2]) for row in rows]
+            result["metadatas"] = [
+                row[2] if isinstance(row[2], dict) else json.loads(row[2]) for row in rows
+            ]
         return result
 
     def query(
@@ -390,6 +399,7 @@ class PostgresCollectionAdapter:
         include: Optional[Sequence[str]] = None,
         where: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        S = self._sql
         include = _normalize_include(include)
         want_docs = "documents" in include
         want_meta = "metadatas" in include
@@ -405,16 +415,20 @@ class PostgresCollectionAdapter:
                 for query_text in query_texts:
                     params: List[Any] = []
                     embedding = _vector_literal(self.embedder.embed_query(query_text))
-                    sql = (
-                        "SELECT id, document, metadata, embedding <=> %s::vector AS distance "
-                        "FROM mempalace_documents"
-                    )
+
+                    parts = [
+                        S.SQL(
+                            "SELECT id, document, metadata,"
+                            " embedding <=> %s::vector AS distance"
+                            " FROM mempalace_documents"
+                        )
+                    ]
                     params.append(embedding)
-                    sql += self._build_where_sql(where, params)
-                    sql += " ORDER BY distance ASC LIMIT %s"
+                    parts.append(self._build_where_sql(where, params))
+                    parts.append(S.SQL(" ORDER BY distance ASC LIMIT %s"))
                     params.append(n_results)
 
-                    cur.execute(sql, params)
+                    cur.execute(S.SQL("").join(parts), params)
                     rows = cur.fetchall()
 
                     all_ids.append([row[0] for row in rows])
@@ -520,22 +534,122 @@ class PostgresBackend:
         self.embedding_dimension = embedding_dimension
         self.embedding_model = embedding_model
 
+        try:
+            import psycopg
+            from psycopg import sql as psycopg_sql
+        except Exception as exc:
+            raise StorageError("Postgres backend requested but psycopg is not installed.") from exc
+
+        self._psycopg = psycopg
+        self._sql = psycopg_sql
+        self._pool = self._create_pool()
+        self._ensure_schema()
+
+    def _create_pool(self):
+        try:
+            from psycopg_pool import ConnectionPool
+
+            return ConnectionPool(conninfo=self.dsn, min_size=1, max_size=10)
+        except ImportError:
+            return None
+
+    def _ensure_schema(self) -> None:
+        if self._pool is not None:
+            ctx = self._pool.connection()
+        else:
+            ctx = self._psycopg.connect(self.dsn)
+        with ctx as conn:
+            with conn.cursor() as cur:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                cur.execute(
+                    self._sql.SQL(
+                        "CREATE TABLE IF NOT EXISTS mempalace_documents ("
+                        "  collection_name TEXT NOT NULL,"
+                        "  id TEXT NOT NULL,"
+                        "  document TEXT NOT NULL,"
+                        "  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,"
+                        "  embedding vector({dim}) NOT NULL,"
+                        "  PRIMARY KEY (collection_name, id)"
+                        ")"
+                    ).format(dim=self._sql.Literal(self.embedding_dimension))
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_mempalace_documents_collection
+                    ON mempalace_documents (collection_name)
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_mempalace_documents_metadata
+                    ON mempalace_documents USING GIN (metadata)
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_mempalace_documents_embedding
+                    ON mempalace_documents USING hnsw (embedding vector_cosine_ops)
+                    """
+                )
+                # Validate that the existing column dimension matches expectations
+                cur.execute(
+                    "SELECT format_type(atttypid, atttypmod) FROM pg_attribute "
+                    "WHERE attrelid = 'mempalace_documents'::regclass "
+                    "AND attname = 'embedding'"
+                )
+                row = cur.fetchone()
+                if row:
+                    import re as _re
+
+                    m = _re.search(r"vector\((\d+)\)", row[0])
+                    if m:
+                        actual_dim = int(m.group(1))
+                        if actual_dim != self.embedding_dimension:
+                            raise StorageError(
+                                f"Embedding dimension mismatch: table has vector({actual_dim}) "
+                                f"but backend is configured for vector({self.embedding_dimension}). "
+                                f"Recreate the table or adjust MEMPALACE_EMBEDDING_DIMENSION."
+                            )
+            conn.commit()
+
     def get_collection(self, collection_name: str, create: bool = False):
-        del create
+        if not create:
+            # Check whether the collection has any rows; raise if not
+            if self._pool is not None:
+                ctx = self._pool.connection()
+            else:
+                ctx = self._psycopg.connect(self.dsn)
+            with ctx as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT 1 FROM mempalace_documents WHERE collection_name = %s LIMIT 1",
+                        (collection_name,),
+                    )
+                    if cur.fetchone() is None:
+                        raise CollectionNotFoundError(
+                            f"Collection '{collection_name}' not found in Postgres"
+                        )
         return PostgresCollectionAdapter(
-            dsn=self.dsn,
             collection_name=collection_name,
+            pool=self._pool,
+            sql_module=self._sql,
             embedding_dimension=self.embedding_dimension,
             embedding_model=self.embedding_model,
+            dsn=self.dsn,
         )
+
+    def close(self):
+        """Shut down the connection pool."""
+        if self._pool is not None:
+            self._pool.close()
 
 
 def _resolve_backend(
+    cfg: MempalaceConfig,
     palace_path: Optional[str] = None,
     backend: Optional[str] = None,
     dsn: Optional[str] = None,
 ):
-    cfg = MempalaceConfig()
     resolved_backend = backend or cfg.storage_backend
     resolved_dsn = dsn or cfg.postgres_dsn
 
@@ -566,5 +680,5 @@ def open_collection(
     dsn: Optional[str] = None,
 ):
     cfg = MempalaceConfig()
-    backend_impl = _resolve_backend(palace_path=palace_path, backend=backend, dsn=dsn)
+    backend_impl = _resolve_backend(cfg, palace_path=palace_path, backend=backend, dsn=dsn)
     return backend_impl.get_collection(collection_name or cfg.collection_name, create=create)

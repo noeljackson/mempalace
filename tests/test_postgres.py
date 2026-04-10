@@ -10,6 +10,7 @@ import os
 import pytest
 
 from mempalace.storage import (
+    CollectionNotFoundError,
     PostgresCollectionAdapter,
     PostgresBackend,
     open_collection,
@@ -26,10 +27,17 @@ pytestmark = pytest.mark.skipif(
 
 # ── helpers ──────────────────────────────────────────────────────────
 
+
+@pytest.fixture(scope="session")
+def backend():
+    """A shared PostgresBackend for the test session."""
+    return PostgresBackend(dsn=POSTGRES_DSN)
+
+
 @pytest.fixture(scope="session", autouse=True)
-def _ensure_schema():
+def _ensure_schema(backend):
     """Create the table once at session start so cleanup fixtures work."""
-    PostgresCollectionAdapter(dsn=POSTGRES_DSN, collection_name="_setup")
+    backend.get_collection("_setup", create=True)
 
 
 def _clean_table(dsn: str):
@@ -51,12 +59,9 @@ def _fresh_table():
 
 
 @pytest.fixture
-def col():
+def col(backend):
     """A PostgresCollectionAdapter pointed at the test database."""
-    return PostgresCollectionAdapter(
-        dsn=POSTGRES_DSN,
-        collection_name="test_col",
-    )
+    return backend.get_collection("test_col", create=True)
 
 
 @pytest.fixture
@@ -82,17 +87,20 @@ def seeded_col(col):
 
 # ── schema ───────────────────────────────────────────────────────────
 
+
 class TestSchema:
-    def test_ensure_schema_creates_table_and_indexes(self):
-        adapter = PostgresCollectionAdapter(dsn=POSTGRES_DSN, collection_name="schema_test")
+    def test_ensure_schema_creates_table_and_indexes(self, backend):
+        adapter = backend.get_collection("schema_test", create=True)
         assert adapter.count() == 0
 
     def test_ensure_schema_is_idempotent(self):
-        PostgresCollectionAdapter(dsn=POSTGRES_DSN, collection_name="idem_a")
-        PostgresCollectionAdapter(dsn=POSTGRES_DSN, collection_name="idem_a")
+        # Two backends with the same DSN — schema creation should not conflict
+        PostgresBackend(dsn=POSTGRES_DSN)
+        PostgresBackend(dsn=POSTGRES_DSN)
 
 
 # ── count ────────────────────────────────────────────────────────────
+
 
 class TestCount:
     def test_empty_collection(self, col):
@@ -103,6 +111,7 @@ class TestCount:
 
 
 # ── add / get ────────────────────────────────────────────────────────
+
 
 class TestAddAndGet:
     def test_get_all(self, seeded_col):
@@ -145,6 +154,7 @@ class TestAddAndGet:
 
 # ── upsert ───────────────────────────────────────────────────────────
 
+
 class TestUpsert:
     def test_upsert_inserts_new(self, col):
         col.upsert(
@@ -171,6 +181,7 @@ class TestUpsert:
 
 # ── delete ───────────────────────────────────────────────────────────
 
+
 class TestDelete:
     def test_delete_specific_ids(self, seeded_col):
         seeded_col.delete(ids=["d1", "d3"])
@@ -184,6 +195,7 @@ class TestDelete:
 
 
 # ── query (vector search) ───────────────────────────────────────────
+
 
 class TestQuery:
     def test_query_returns_relevant_results(self, seeded_col):
@@ -232,10 +244,11 @@ class TestQuery:
 
 # ── collection isolation ─────────────────────────────────────────────
 
+
 class TestCollectionIsolation:
-    def test_different_collections_are_isolated(self):
-        col_a = PostgresCollectionAdapter(dsn=POSTGRES_DSN, collection_name="iso_a")
-        col_b = PostgresCollectionAdapter(dsn=POSTGRES_DSN, collection_name="iso_b")
+    def test_different_collections_are_isolated(self, backend):
+        col_a = backend.get_collection("iso_a", create=True)
+        col_b = backend.get_collection("iso_b", create=True)
 
         col_a.add(
             ids=["x1"],
@@ -256,15 +269,22 @@ class TestCollectionIsolation:
 
 # ── PostgresBackend factory ──────────────────────────────────────────
 
+
 class TestPostgresBackend:
-    def test_get_collection_returns_adapter(self):
+    def test_get_collection_returns_adapter_with_create(self):
         backend = PostgresBackend(dsn=POSTGRES_DSN)
-        col = backend.get_collection("backend_test")
+        col = backend.get_collection("backend_test", create=True)
         assert isinstance(col, PostgresCollectionAdapter)
         assert col.count() == 0
 
+    def test_get_collection_raises_without_create(self):
+        backend = PostgresBackend(dsn=POSTGRES_DSN)
+        with pytest.raises(CollectionNotFoundError):
+            backend.get_collection("nonexistent_collection", create=False)
+
 
 # ── open_collection integration ──────────────────────────────────────
+
 
 class TestOpenCollection:
     def test_open_collection_with_postgres_dsn(self):
@@ -272,6 +292,7 @@ class TestOpenCollection:
             backend="postgres",
             dsn=POSTGRES_DSN,
             collection_name="open_col_test",
+            create=True,
         )
         assert isinstance(col, PostgresCollectionAdapter)
         assert col.count() == 0
@@ -279,13 +300,11 @@ class TestOpenCollection:
 
 # ── migration from Chroma to Postgres ────────────────────────────────
 
+
 class TestMigration:
-    def test_migrate_chroma_to_postgres(self, seeded_collection):
+    def test_migrate_chroma_to_postgres(self, seeded_collection, backend):
         """Migrate from the Chroma seeded_collection fixture to Postgres."""
-        target = PostgresCollectionAdapter(
-            dsn=POSTGRES_DSN,
-            collection_name="migration_target",
-        )
+        target = backend.get_collection("migration_target", create=True)
         result = migrate_collection(seeded_collection, target, batch_size=2)
         assert result["scanned"] == 4
         assert result["written"] == 4
