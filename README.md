@@ -106,6 +106,29 @@ mempalace status
 
 Three mining modes: **projects** (code and docs), **convos** (conversation exports), and **general** (auto-classifies into decisions, preferences, milestones, problems, and emotional context). Everything stays on your machine.
 
+### Storage Backends
+
+MemPalace defaults to **local Chroma** for the palace index. That runs on your machine. If you want Postgres instead, MemPalace now supports a storage adapter path for **Postgres + pgvector**.
+
+Install the Postgres extra:
+
+```bash
+pip install "mempalace[postgres]"
+```
+
+Migrate an existing local palace:
+
+```bash
+export MEMPALACE_POSTGRES_DSN="postgresql://user:pass@host:5432/mempalace"
+mempalace migrate-postgres --source-palace ~/.mempalace/palace
+```
+
+Then switch the app to Postgres:
+
+```bash
+export MEMPALACE_STORAGE_BACKEND=postgres
+```
+
 ---
 
 ## How You Actually Use It

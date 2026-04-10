@@ -1,11 +1,14 @@
 """
 palace.py — Shared palace operations.
 
-Consolidates ChromaDB access patterns used by both miners and the MCP server.
+Consolidates storage access patterns used by both miners and the MCP server.
+Routes through the pluggable storage backend (Chroma by default, Postgres
+when configured) so downstream code sees a single collection interface.
 """
 
 import os
-import chromadb
+
+from .storage import open_collection
 
 SKIP_DIRS = {
     ".git",
@@ -35,17 +38,21 @@ SKIP_DIRS = {
 
 
 def get_collection(palace_path: str, collection_name: str = "mempalace_drawers"):
-    """Get or create the palace ChromaDB collection."""
-    os.makedirs(palace_path, exist_ok=True)
-    try:
-        os.chmod(palace_path, 0o700)
-    except (OSError, NotImplementedError):
-        pass
-    client = chromadb.PersistentClient(path=palace_path)
-    try:
-        return client.get_collection(collection_name)
-    except Exception:
-        return client.create_collection(collection_name)
+    """Get or create the palace collection via the configured storage backend."""
+    # For local Chroma backends, tighten directory permissions up-front.
+    # The storage layer is tolerant of a missing/unwritable path for remote
+    # backends (e.g. Postgres), so only apply this when the path looks local.
+    if palace_path and not palace_path.lower().startswith(("postgres://", "postgresql://")):
+        try:
+            os.makedirs(palace_path, exist_ok=True)
+            os.chmod(palace_path, 0o700)
+        except (OSError, NotImplementedError):
+            pass
+    return open_collection(
+        palace_path=palace_path,
+        collection_name=collection_name,
+        create=True,
+    )
 
 
 def file_already_mined(collection, source_file: str, check_mtime: bool = False) -> bool:
@@ -56,11 +63,14 @@ def file_already_mined(collection, source_file: str, check_mtime: bool = False) 
     When check_mtime=False (used by convo miner), just checks existence.
     """
     try:
-        results = collection.get(where={"source_file": source_file}, limit=1)
+        get_kwargs = {"where": {"source_file": source_file}, "limit": 1}
+        if check_mtime:
+            get_kwargs["include"] = ["metadatas"]
+        results = collection.get(**get_kwargs)
         if not results.get("ids"):
             return False
         if check_mtime:
-            stored_meta = results.get("metadatas", [{}])[0]
+            stored_meta = (results.get("metadatas") or [{}])[0] or {}
             stored_mtime = stored_meta.get("source_mtime")
             if stored_mtime is None:
                 return False

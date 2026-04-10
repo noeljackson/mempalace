@@ -32,6 +32,7 @@ import pytest  # noqa: E402
 
 from mempalace.config import MempalaceConfig  # noqa: E402
 from mempalace.knowledge_graph import KnowledgeGraph  # noqa: E402
+from mempalace.storage import open_collection  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -99,11 +100,15 @@ def config(tmp_dir, palace_path):
 
 @pytest.fixture
 def collection(palace_path):
-    """A ChromaDB collection pre-seeded in the temp palace."""
-    client = chromadb.PersistentClient(path=palace_path)
-    col = client.get_or_create_collection("mempalace_drawers")
+    """A storage-backed collection pre-seeded in the temp palace."""
+    col = open_collection(palace_path=palace_path, create=True)
     yield col
-    client.delete_collection("mempalace_drawers")
+    # Temp palace dir is removed by tmp_dir fixture; no explicit teardown.
+    client = chromadb.PersistentClient(path=palace_path)
+    try:
+        client.delete_collection("mempalace_drawers")
+    except Exception:
+        pass
     del client
 
 

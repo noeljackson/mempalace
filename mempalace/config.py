@@ -60,6 +60,8 @@ def sanitize_content(value: str, max_length: int = 100_000) -> str:
 
 DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
+DEFAULT_STORAGE_BACKEND = "chroma"
+DEFAULT_EMBEDDING_DIMENSION = 384
 
 DEFAULT_TOPIC_WINGS = [
     "emotions",
@@ -153,6 +155,42 @@ class MempalaceConfig:
         return self._file_config.get("collection_name", DEFAULT_COLLECTION_NAME)
 
     @property
+    def storage_backend(self):
+        """Storage backend name ('chroma' or 'postgres')."""
+        env_val = os.environ.get("MEMPALACE_STORAGE_BACKEND")
+        if env_val:
+            return env_val
+        return self._file_config.get("storage_backend", DEFAULT_STORAGE_BACKEND)
+
+    @property
+    def postgres_dsn(self):
+        """Postgres DSN used by the postgres storage adapter."""
+        return (
+            os.environ.get("MEMPALACE_POSTGRES_DSN")
+            or os.environ.get("MEMPALACE_DATABASE_URL")
+            or self._file_config.get("postgres_dsn")
+            or self._file_config.get("database_url")
+        )
+
+    @property
+    def embedding_model(self):
+        """Optional embedding model override for explicit embedding backends."""
+        return os.environ.get("MEMPALACE_EMBEDDING_MODEL") or self._file_config.get(
+            "embedding_model"
+        )
+
+    @property
+    def embedding_dimension(self):
+        """Embedding dimension for vector-backed stores that require explicit schema."""
+        env_val = os.environ.get("MEMPALACE_EMBEDDING_DIMENSION")
+        if env_val:
+            try:
+                return int(env_val)
+            except ValueError:
+                pass
+        return int(self._file_config.get("embedding_dimension", DEFAULT_EMBEDDING_DIMENSION))
+
+    @property
     def people_map(self):
         """Mapping of name variants to canonical names."""
         if self._people_map_file.exists():
@@ -185,6 +223,10 @@ class MempalaceConfig:
             default_config = {
                 "palace_path": DEFAULT_PALACE_PATH,
                 "collection_name": DEFAULT_COLLECTION_NAME,
+                "storage_backend": DEFAULT_STORAGE_BACKEND,
+                "postgres_dsn": None,
+                "embedding_model": None,
+                "embedding_dimension": DEFAULT_EMBEDDING_DIMENSION,
                 "topic_wings": DEFAULT_TOPIC_WINGS,
                 "hall_keywords": DEFAULT_HALL_KEYWORDS,
             }

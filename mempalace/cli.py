@@ -15,6 +15,7 @@ Commands:
     mempalace mine <dir> --mode convos    Mine conversation exports
     mempalace search "query"              Find anything, exact words
     mempalace mcp                         Show MCP setup command
+    mempalace migrate-postgres            Copy a local Chroma palace into Postgres
     mempalace wake-up                     Show L0 + L1 wake-up context
     mempalace wake-up --wing my_app       Wake-up for a specific project
     mempalace status                      Show what's been filed
@@ -262,6 +263,92 @@ def cmd_mcp(args):
         print("\nOptional custom palace:")
         print(f"  claude mcp add mempalace -- {base_server_cmd} --palace /path/to/palace")
         print(f"  {base_server_cmd} --palace /path/to/palace")
+
+
+def cmd_migrate_postgres(args):
+    """Copy an existing Chroma collection into a Postgres backend."""
+    from .storage import (
+        CollectionNotFoundError,
+        StorageError,
+        migrate_collection,
+        open_collection,
+    )
+
+    cfg = MempalaceConfig()
+    source_palace = (
+        os.path.expanduser(args.source_palace) if args.source_palace else cfg.palace_path
+    )
+    source_collection_name = args.source_collection or cfg.collection_name
+    target_collection_name = args.target_collection or source_collection_name
+    target_dsn = args.target_dsn or cfg.postgres_dsn
+
+    if not target_dsn:
+        print("\n  No target Postgres DSN configured.")
+        print("  Pass --target-dsn or set MEMPALACE_POSTGRES_DSN.")
+        sys.exit(1)
+
+    print(f"\n{'=' * 55}")
+    print("  MemPalace Migrate — Chroma to Postgres")
+    print(f"{'=' * 55}")
+    print(f"  Source palace:      {source_palace}")
+    print(f"  Source collection:  {source_collection_name}")
+    print(f"  Target collection:  {target_collection_name}")
+    print(f"  Batch size:         {args.batch_size}")
+    if args.dry_run:
+        print("  DRY RUN — nothing will be written")
+    print(f"{'─' * 55}\n")
+
+    try:
+        source = open_collection(
+            palace_path=source_palace,
+            collection_name=source_collection_name,
+            backend="chroma",
+        )
+    except (CollectionNotFoundError, StorageError) as e:
+        print(f"  Could not open source Chroma palace: {e}")
+        sys.exit(1)
+
+    try:
+        total = source.count()
+    except Exception as e:
+        print(f"  Could not count source drawers: {e}")
+        sys.exit(1)
+
+    print(f"  Source drawers:     {total}")
+    if total == 0:
+        print("  Nothing to migrate.")
+        return
+
+    if args.dry_run:
+        print("\n  Dry run complete.")
+        return
+
+    try:
+        target = open_collection(
+            collection_name=target_collection_name,
+            backend="postgres",
+            dsn=target_dsn,
+            create=True,
+        )
+    except (CollectionNotFoundError, StorageError) as e:
+        print(f"  Could not open target Postgres collection: {e}")
+        sys.exit(1)
+
+    try:
+        result = migrate_collection(
+            source_collection=source,
+            target_collection=target,
+            batch_size=args.batch_size,
+        )
+    except Exception as e:
+        print(f"\n  Migration failed: {e}")
+        sys.exit(1)
+
+    print(f"\n  Migrated {result['written']} drawers.")
+    print("\n  To use Postgres by default:")
+    print("    export MEMPALACE_STORAGE_BACKEND=postgres")
+    print("    export MEMPALACE_POSTGRES_DSN='postgresql://user:pass@host:5432/dbname'")
+    print(f"\n{'=' * 55}\n")
 
 
 def cmd_compress(args):
@@ -530,6 +617,43 @@ def main():
         help="Show MCP setup command for connecting MemPalace to your AI client",
     )
 
+    # migrate-postgres
+    p_migrate = sub.add_parser(
+        "migrate-postgres",
+        help="Copy an existing local Chroma palace into a Postgres backend",
+    )
+    p_migrate.add_argument(
+        "--source-palace",
+        default=None,
+        help="Path to the existing Chroma palace (default: configured palace path)",
+    )
+    p_migrate.add_argument(
+        "--source-collection",
+        default=None,
+        help="Source collection name (default: configured collection name)",
+    )
+    p_migrate.add_argument(
+        "--target-dsn",
+        default=None,
+        help="Postgres DSN (default: MEMPALACE_POSTGRES_DSN / config)",
+    )
+    p_migrate.add_argument(
+        "--target-collection",
+        default=None,
+        help="Target collection name in Postgres (default: same as source collection)",
+    )
+    p_migrate.add_argument(
+        "--batch-size",
+        type=int,
+        default=1000,
+        help="Rows to copy per batch (default: 1000)",
+    )
+    p_migrate.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Inspect the source and target settings without writing anything",
+    )
+
     # status
     sub.add_parser("status", help="Show what's been filed")
 
@@ -562,6 +686,7 @@ def main():
         "split": cmd_split,
         "search": cmd_search,
         "mcp": cmd_mcp,
+        "migrate-postgres": cmd_migrate_postgres,
         "compress": cmd_compress,
         "wake-up": cmd_wakeup,
         "repair": cmd_repair,
