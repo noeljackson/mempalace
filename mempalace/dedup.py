@@ -12,7 +12,9 @@ No API calls — uses ChromaDB's built-in embedding similarity.
 Usage (standalone):
     python -m mempalace.dedup                          # dedup all
     python -m mempalace.dedup --dry-run                # preview only
-    python -m mempalace.dedup --threshold 0.10         # stricter
+    python -m mempalace.dedup --threshold 0.10         # stricter (near-identical only)
+    python -m mempalace.dedup --threshold 0.35         # looser (catches paraphrased content)
+    python -m mempalace.dedup --wing my_project        # scope to one wing
     python -m mempalace.dedup --stats                  # stats only
     python -m mempalace.dedup --source "my_project"    # filter by source
 
@@ -29,6 +31,9 @@ import chromadb
 
 
 COLLECTION_NAME = "mempalace_drawers"
+# Cosine DISTANCE threshold (not similarity). Lower = stricter.
+# 0.15 = ~85% cosine similarity — catches near-identical chunks.
+# For looser dedup of paraphrased content, try 0.3–0.4.
 DEFAULT_THRESHOLD = 0.15
 MIN_DRAWERS_TO_CHECK = 5
 
@@ -42,15 +47,22 @@ def _get_palace_path():
         return os.path.join(os.path.expanduser("~"), ".mempalace", "palace")
 
 
-def get_source_groups(col, min_count=MIN_DRAWERS_TO_CHECK, source_pattern=None):
-    """Group drawers by source_file, return groups with min_count+ entries."""
+def get_source_groups(col, min_count=MIN_DRAWERS_TO_CHECK, source_pattern=None, wing=None):
+    """Group drawers by source_file, return groups with min_count+ entries.
+
+    If wing is specified, only considers drawers in that wing. This catches
+    cross-wing duplicates when the same source was mined into multiple wings.
+    """
     total = col.count()
     groups = defaultdict(list)
 
     offset = 0
     batch_size = 1000
     while offset < total:
-        batch = col.get(limit=batch_size, offset=offset, include=["metadatas"])
+        kwargs = {"limit": batch_size, "offset": offset, "include": ["metadatas"]}
+        if wing:
+            kwargs["where"] = {"wing": wing}
+        batch = col.get(**kwargs)
         if not batch["ids"]:
             break
         for did, meta in zip(batch["ids"], batch["metadatas"]):
@@ -143,6 +155,7 @@ def dedup_palace(
     dry_run=True,
     source_pattern=None,
     min_count=MIN_DRAWERS_TO_CHECK,
+    wing=None,
 ):
     """Main entry point: deduplicate near-identical drawers across the palace."""
     palace_path = palace_path or _get_palace_path()
@@ -160,7 +173,9 @@ def dedup_palace(
     print(f"  Mode: {'DRY RUN' if dry_run else 'LIVE'}")
     print(f"{'─' * 55}")
 
-    groups = get_source_groups(col, min_count, source_pattern)
+    if wing:
+        print(f"  Wing: {wing}")
+    groups = get_source_groups(col, min_count, source_pattern, wing=wing)
     print(f"\n  Sources to check: {len(groups)}")
 
     t0 = time.time()
@@ -208,6 +223,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--dry-run", action="store_true", help="Preview without deleting")
     parser.add_argument("--stats", action="store_true", help="Show stats only")
+    parser.add_argument("--wing", default=None, help="Scope dedup to a single wing")
     parser.add_argument("--source", default=None, help="Filter by source file pattern")
     args = parser.parse_args()
 
@@ -221,4 +237,5 @@ if __name__ == "__main__":
             threshold=args.threshold,
             dry_run=args.dry_run,
             source_pattern=args.source,
+            wing=args.wing,
         )
